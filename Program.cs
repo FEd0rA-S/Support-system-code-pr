@@ -150,6 +150,33 @@ namespace SupportTriage
             Console.WriteLine($"LogLoss: {metrics.LogLoss:F2}");
             Console.WriteLine(metrics.ConfusionMatrix.GetFormattedConfusionTable());
 
+            // ========== BASELINE: ВСЕГДА NEUTRAL + MACRO-F1 ==========
+            var testLabels = mlContext.Data.CreateEnumerable<TicketInput>(split.TestSet, reuseRowObject: false)
+                .Select(t => t.Sentiment).ToList();
+            int neutralCount = testLabels.Count(l => l == "neutral");
+            double baselineAccuracy = (double)neutralCount / testLabels.Count;
+
+            Console.WriteLine($"\n=== Базовая линия «всегда neutral» ===");
+            Console.WriteLine($"Доля neutral в тесте: {baselineAccuracy:P2} ({neutralCount}/{testLabels.Count})");
+            Console.WriteLine($"Accuracy модели: {metrics.MacroAccuracy:P2}");
+            Console.WriteLine($"Прирост над baseline: {(metrics.MacroAccuracy - baselineAccuracy):P2}");
+
+            Console.WriteLine("\n=== Macro-F1 по классам ===");
+            var cm = metrics.ConfusionMatrix;
+            double[] f1Scores = new double[3];
+            string[] classNames = { "neutral", "negative", "positive" };
+            for (int i = 0; i < 3; i++)
+            {
+                double rowSum = 0, colSum = 0;
+                for (int j = 0; j < 3; j++) { rowSum += cm.Counts[i][j]; colSum += cm.Counts[j][i]; }
+                double recall = rowSum > 0 ? (double)cm.Counts[i][i] / rowSum : 0;
+                double precision = colSum > 0 ? (double)cm.Counts[i][i] / colSum : 0;
+                double f1 = (precision + recall) > 0 ? 2 * precision * recall / (precision + recall) : 0;
+                f1Scores[i] = f1;
+                Console.WriteLine($"  {classNames[i],-8}: Precision={precision:F3}, Recall={recall:F3}, F1={f1:F3}");
+            }
+            Console.WriteLine($"  Macro-F1: {f1Scores.Average():F3}");
+
             // 7. Создаём движок для предсказаний
             var predEngine = mlContext.Model.CreatePredictionEngine<TicketInput, TicketPrediction>(model);
 
@@ -250,6 +277,103 @@ namespace SupportTriage
                     Console.WriteLine($"[{(match ? "OK  " : "MISS")}] Истина: {item.Sentiment,-8} | Модель: {pred.PredictedSentiment,-8} | {shortText}");
                 }
                 Console.WriteLine($"\nСовпадение с ручной разметкой: {correct}/{goldSet.Count} = {(double)correct / goldSet.Count:P1}");
+            }
+
+            // ========== ПРОВЕРКА НА ТИКЕТАХ ПОДДЕРЖКИ ==========
+            if (File.Exists("support_tickets.csv"))
+            {
+                var supportTickets = new List<TicketInput>();
+                using (var reader = new StreamReader("support_tickets.csv", System.Text.Encoding.UTF8))
+                using (var csv = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture)
+                {
+                    HasHeaderRecord = true,
+                    BadDataFound = null,
+                    MissingFieldFound = null
+                }))
+                {
+                    if (csv.Read())
+                    {
+                        csv.ReadHeader();
+                        while (csv.Read())
+                        {
+                            var lbl = csv.GetField("label")?.Trim();
+                            var txt = csv.GetField("text")?.Trim();
+                            if (lbl != "positive" && lbl != "negative" && lbl != "neutral") continue;
+                            if (string.IsNullOrEmpty(txt)) continue;
+                            var pt = PreprocessText(txt);
+                            supportTickets.Add(new TicketInput { Text = pt, TextLength = pt.Length, Sentiment = lbl, Weight = 1.0f });
+                        }
+                    }
+                }
+
+                Console.WriteLine($"\n=== Проверка на тикетах поддержки ({supportTickets.Count} записей) ===");
+                int correctTickets = 0;
+                var byClass = new Dictionary<string, (int total, int ok)>();
+                foreach (var item in supportTickets)
+                {
+                    var pred = predEngine.Predict(item);
+                    bool match = pred.PredictedSentiment == item.Sentiment;
+                    if (match) correctTickets++;
+                    if (!byClass.ContainsKey(item.Sentiment)) byClass[item.Sentiment] = (0, 0);
+                    var (t, o) = byClass[item.Sentiment];
+                    byClass[item.Sentiment] = (t + 1, o + (match ? 1 : 0));
+                }
+                Console.WriteLine($"Общая точность: {correctTickets}/{supportTickets.Count} = {(double)correctTickets / supportTickets.Count:P1}");
+                foreach (var kv in byClass)
+                {
+                    Console.WriteLine($"  {kv.Key,-8}: {kv.Value.ok}/{kv.Value.total} = {(double)kv.Value.ok / kv.Value.total:P1}");
+                }
+            }
+
+            // ========== СРАВНЕНИЕ ТРЕНЕРОВ ==========
+            Console.WriteLine("\n=== Сравнение тренеров ===");
+
+            var trainers = new (string Name, IEstimator<ITransformer> Pipeline)[]
+            {
+    ("Sdca", mlContext.Transforms.Conversion
+        .MapValueToKey("Label")
+        .Append(mlContext.Transforms.Text.FeaturizeText("TextFeatures", nameof(TicketInput.Text)))
+        .Append(mlContext.Transforms.Concatenate("Features", "TextFeatures", nameof(TicketInput.TextLength)))
+        .Append(mlContext.MulticlassClassification.Trainers.SdcaMaximumEntropy("Label", "Features", exampleWeightColumnName: "Weight"))
+        .Append(mlContext.Transforms.Conversion.MapKeyToValue("PredictedLabel"))),
+
+    ("Lbfgs", mlContext.Transforms.Conversion
+        .MapValueToKey("Label")
+        .Append(mlContext.Transforms.Text.FeaturizeText("TextFeatures", nameof(TicketInput.Text)))
+        .Append(mlContext.Transforms.Concatenate("Features", "TextFeatures", nameof(TicketInput.TextLength)))
+        .Append(mlContext.MulticlassClassification.Trainers.LbfgsMaximumEntropy("Label", "Features", exampleWeightColumnName: "Weight"))
+        .Append(mlContext.Transforms.Conversion.MapKeyToValue("PredictedLabel"))),
+
+    ("NaiveBayes", mlContext.Transforms.Conversion
+        .MapValueToKey("Label")
+        .Append(mlContext.Transforms.Text.FeaturizeText("Features", nameof(TicketInput.Text)))
+        .Append(mlContext.MulticlassClassification.Trainers.NaiveBayes("Label", "Features"))
+        .Append(mlContext.Transforms.Conversion.MapKeyToValue("PredictedLabel"))),
+            };
+
+            foreach (var (name, pipe) in trainers)
+            {
+                try
+                {
+                    var m = pipe.Fit(split.TrainSet);
+                    var p = m.Transform(split.TestSet);
+                    var met = mlContext.MulticlassClassification.Evaluate(p);
+                    var cm2 = met.ConfusionMatrix;
+                    double[] f1s = new double[3];
+                    for (int i = 0; i < 3; i++)
+                    {
+                        double r = 0, c = 0;
+                        for (int j = 0; j < 3; j++) { r += cm2.Counts[i][j]; c += cm2.Counts[j][i]; }
+                        double rec = r > 0 ? (double)cm2.Counts[i][i] / r : 0;
+                        double prec = c > 0 ? (double)cm2.Counts[i][i] / c : 0;
+                        f1s[i] = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+                    }
+                    Console.WriteLine($"  {name,-12}: Acc={met.MacroAccuracy:F3}, MicroAcc={met.MicroAccuracy:F3}, Macro-F1={f1s.Average():F3}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  {name,-12}: ошибка — {ex.Message}");
+                }
             }
 
             Console.WriteLine("\nНажмите любую клавишу для выхода...");
