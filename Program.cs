@@ -59,6 +59,28 @@ namespace SupportTriage
                 .Replace("(", " ")
                 .Replace("  ", " ");
         }
+        static double ComputeMacroF1(PredictionEngine<TicketInput, TicketPrediction> engine, List<TicketInput> testSet)
+        {
+            var classes = new[] { "neutral", "negative", "positive" };
+            var f1s = new double[3];
+            for (int c = 0; c < 3; c++)
+            {
+                int tp = 0, fp = 0, fn = 0;
+                foreach (var item in testSet)
+                {
+                    var pred = engine.Predict(item).PredictedSentiment;
+                    bool isTrue = item.Sentiment == classes[c];
+                    bool isPred = pred == classes[c];
+                    if (isTrue && isPred) tp++;
+                    else if (!isTrue && isPred) fp++;
+                    else if (isTrue && !isPred) fn++;
+                }
+                double prec = tp + fp > 0 ? (double)tp / (tp + fp) : 0;
+                double rec = tp + fn > 0 ? (double)tp / (tp + fn) : 0;
+                f1s[c] = prec + rec > 0 ? 2 * prec * rec / (prec + rec) : 0;
+            }
+            return f1s.Average();
+        }
         // 2.
         static void Main(string[] args)
         {
@@ -324,6 +346,71 @@ namespace SupportTriage
                     Console.WriteLine($"  {kv.Key,-8}: {kv.Value.ok}/{kv.Value.total} = {(double)kv.Value.ok / kv.Value.total:P1}");
                 }
             }
+            // ========== ЭКСПЕРИМЕНТ: ДОБАВЛЕНИЕ ДОМЕННЫХ ДАННЫХ В ОБУЧЕНИЕ ==========
+            if (File.Exists("support_tickets_v2.csv"))
+            {
+                var domainAll = new List<TicketInput>();
+                using (var reader = new StreamReader("support_tickets_v2.csv", System.Text.Encoding.UTF8))
+                using (var csv = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture)
+                {
+                    HasHeaderRecord = true,
+                    BadDataFound = null,
+                    MissingFieldFound = null
+                }))
+                {
+                    if (csv.Read())
+                    {
+                        csv.ReadHeader();
+                        while (csv.Read())
+                        {
+                            var lbl = csv.GetField("label")?.Trim();
+                            var txt = csv.GetField("text")?.Trim();
+                            if (lbl != "positive" && lbl != "negative" && lbl != "neutral") continue;
+                            if (string.IsNullOrEmpty(txt)) continue;
+                            var pt = PreprocessText(txt);
+                            domainAll.Add(new TicketInput { Text = pt, TextLength = pt.Length, Sentiment = lbl, Weight = 1.0f });
+                        }
+                    }
+                }
+
+                // Стратифицированное разделение 50/50
+                var rnd2 = new Random(42);
+                var domainTrain = new List<TicketInput>();
+                var domainTest = new List<TicketInput>();
+                foreach (var grp in domainAll.GroupBy(t => t.Sentiment))
+                {
+                    var shuffled = grp.OrderBy(_ => rnd2.Next()).ToList();
+                    int half = shuffled.Count / 2;
+                    domainTrain.AddRange(shuffled.Take(half));
+                    domainTest.AddRange(shuffled.Skip(half));
+                }
+
+                Console.WriteLine($"\n=== Эксперимент: доменные данные в обучении ===");
+                Console.WriteLine($"Домен: train={domainTrain.Count}, test={domainTest.Count}");
+
+                // Модель «до» — обучена только на VK (уже есть как model)
+                // Модель «после» — обучена на VK + domainTrain
+                var combined = tickets.Concat(domainTrain).ToList();
+                var combinedData = mlContext.Data.LoadFromEnumerable(combined);
+
+                var newPipeline = mlContext.Transforms.Conversion
+                    .MapValueToKey("Label")
+                    .Append(mlContext.Transforms.Text.FeaturizeText("TextFeatures", nameof(TicketInput.Text)))
+                    .Append(mlContext.Transforms.Concatenate("Features", "TextFeatures", nameof(TicketInput.TextLength)))
+                    .Append(mlContext.MulticlassClassification.Trainers.LbfgsMaximumEntropy("Label", "Features", exampleWeightColumnName: "Weight"))
+                    .Append(mlContext.Transforms.Conversion.MapKeyToValue("PredictedLabel"));
+
+                var modelAfter = newPipeline.Fit(combinedData);
+                var predEngineAfter = mlContext.Model.CreatePredictionEngine<TicketInput, TicketPrediction>(modelAfter);
+
+                // Оцениваем обе модели на ОДНОМ И ТОМ ЖЕ тесте (domainTest)
+                double macroF1Before = ComputeMacroF1(predEngine, domainTest);
+                double macroF1After = ComputeMacroF1(predEngineAfter, domainTest);
+
+                Console.WriteLine($"Macro-F1 ДО (обучение на VK): {macroF1Before:F3}");
+                Console.WriteLine($"Macro-F1 ПОСЛЕ (VK + домен): {macroF1After:F3}");
+                Console.WriteLine($"Прирост: {(macroF1After - macroF1Before):+0.000;-0.000}");
+            }
 
             // ========== СРАВНЕНИЕ ТРЕНЕРОВ ==========
             Console.WriteLine("\n=== Сравнение тренеров ===");
@@ -375,6 +462,8 @@ namespace SupportTriage
                     Console.WriteLine($"  {name,-12}: ошибка — {ex.Message}");
                 }
             }
+
+            
 
             Console.WriteLine("\nНажмите любую клавишу для выхода...");
             Console.ReadKey();
