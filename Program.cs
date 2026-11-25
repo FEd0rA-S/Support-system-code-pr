@@ -15,6 +15,9 @@ namespace SupportTriage
     {
         public string Text { get; set; }
         public float TextLength { get; set; }
+        public float HasPositiveWord { get; set; }
+        public float HasNegativeWord { get; set; }
+        public float ShortPositive { get; set; }
 
         [ColumnName("Label")]
         public string Sentiment { get; set; }
@@ -46,18 +49,40 @@ namespace SupportTriage
         static string PreprocessText(string text)
         {
             if (string.IsNullOrEmpty(text)) return text;
-            return text
-                .Replace(":D", " смех ")
-                .Replace(":)", " улыбка ")
-                .Replace("))))", " смех ")
-                .Replace(")))", " смех ")
-                .Replace("))", " смех ")
-                .Replace("❤", " любовь ")
-                .Replace("💕", " любовь ")
-                .Replace("😍", " восторг ")
-                .Replace("😊", " радость ")
-                .Replace("(", " ")
-                .Replace("  ", " ");
+
+            var positiveMarkers = new[] {
+        "спасибо", "супер", "отлично", "хорошо", "люблю", "обожаю",
+        "нравится", "класс", "круто", "молодец", "рад", "счастлив",
+        "прекрасн", "восхит", "восторг", "благодар"
+    };
+            var lower = text.ToLower();
+            bool hasPositive = positiveMarkers.Any(m => lower.Contains(m));
+
+            var result = text;
+            if (hasPositive)
+            {
+                result = result
+                    .Replace(":D", " смех ").Replace(":)", " улыбка ")
+                    .Replace("))))", " смех ").Replace(")))", " смех ")
+                    .Replace("))", " смех ").Replace("❤", " любовь ")
+                    .Replace("💕", " любовь ").Replace("😍", " восторг ")
+                    .Replace("😊", " радость ");
+            }
+            else
+            {
+                result = result
+                    .Replace("(((", " грусть ")
+                    .Replace("((", " грусть ")
+                    .Replace(":(", " грусть ")
+                    .Replace(":D", " ")
+                    .Replace(":)", " ")
+                    .Replace(")", " ")
+                    .Replace("❤", " ")
+                    .Replace("💕", " ")
+                    .Replace("😍", " ")
+                    .Replace("😊", " ");
+            }
+            return result.Replace("(", " ").Replace("  ", " ").Trim();
         }
         static double ComputeMacroF1(PredictionEngine<TicketInput, TicketPrediction> engine, List<TicketInput> testSet)
         {
@@ -80,6 +105,23 @@ namespace SupportTriage
                 f1s[c] = prec + rec > 0 ? 2 * prec * rec / (prec + rec) : 0;
             }
             return f1s.Average();
+        }
+        static (float hasPos, float hasNeg) DetectWordMarkers(string text)
+        {
+            var positive = new[] { "спасибо", "благодар", "отлично", "супер",
+        "хорошо", "люблю", "обожаю", "нравится", "класс", "круто",
+        "молодец", "рад", "счастлив", "прекрасн", "восхит", "восторг",
+        "оперативно", "профессионал", "рекомендую", "доволен" };
+            var negative = new[] { "не работает", "не работают", "ошибка",
+        "сломал", "ужас", "плохо", "кошмар", "невозможно", "проблема",
+        "жалоба", "разочарован", "верните", "обман", "не пришл",
+        "не отвеча", "насилие", "трагедия", "гибель", "убийство",
+        "болезн", "больница", "операция", "обессилен", "жертва", "грусть" };
+            var lower = text.ToLower();
+            return (
+                positive.Any(w => lower.Contains(w)) ? 1f : 0f,
+                negative.Any(w => lower.Contains(w)) ? 1f : 0f
+            );
         }
         // 2.
         static void Main(string[] args)
@@ -109,17 +151,19 @@ namespace SupportTriage
                         if (label != "positive" && label != "negative" && label != "neutral") continue;
                         if (string.IsNullOrEmpty(text)) continue;
 
-                        // МОЖНО ОТКЛЮЧИТЬ: раскомментируй строку ниже, чтобы все веса были 1.0
                         float weight = label == "negative" ? 2.0f
                                      : label == "positive" ? 1.5f
                                      : 1.0f;
 
                         var processedText = PreprocessText(text);
-
+                        var markers = DetectWordMarkers(text);
                         tickets.Add(new TicketInput
                         {
                             Text = processedText,
                             TextLength = processedText.Length,
+                            HasPositiveWord = markers.hasPos,
+                            HasNegativeWord = markers.hasNeg,
+                            ShortPositive = (processedText.Length < 30 && markers.hasPos == 1f) ? 1f : 0f,
                             Sentiment = label,
                             Weight = weight
                         });
@@ -149,7 +193,11 @@ namespace SupportTriage
                 .MapValueToKey("Label")
                 .Append(mlContext.Transforms.Text.FeaturizeText("TextFeatures", nameof(TicketInput.Text)))
                 .Append(mlContext.Transforms.Concatenate("Features",
-                    "TextFeatures", nameof(TicketInput.TextLength)))
+    "TextFeatures",
+    nameof(TicketInput.TextLength),
+    nameof(TicketInput.HasPositiveWord),
+    nameof(TicketInput.HasNegativeWord),
+    nameof(TicketInput.ShortPositive)))
                 .Append(mlContext.MulticlassClassification.Trainers
                     .LbfgsMaximumEntropy(
                     labelColumnName: "Label",
@@ -269,10 +317,14 @@ namespace SupportTriage
                             if (lbl != "positive" && lbl != "negative" && lbl != "neutral") continue;
                             if (string.IsNullOrEmpty(txt)) continue;
                             var processed = PreprocessText(txt);
+                            var markers = DetectWordMarkers(txt);
                             testTickets.Add(new TicketInput
                             {
                                 Text = processed,
                                 TextLength = processed.Length,
+                                HasPositiveWord = markers.hasPos,
+                                HasNegativeWord = markers.hasNeg,
+                                ShortPositive = (processed.Length < 30 && markers.hasPos == 1f) ? 1f : 0f,
                                 Sentiment = lbl,
                                 Weight = 1.0f
                             });
@@ -323,7 +375,16 @@ namespace SupportTriage
                             if (lbl != "positive" && lbl != "negative" && lbl != "neutral") continue;
                             if (string.IsNullOrEmpty(txt)) continue;
                             var pt = PreprocessText(txt);
-                            supportTickets.Add(new TicketInput { Text = pt, TextLength = pt.Length, Sentiment = lbl, Weight = 1.0f });
+                            var markers = DetectWordMarkers(txt);
+                            supportTickets.Add(new TicketInput
+                            {
+                                Text = pt,
+                                TextLength = pt.Length,
+                                HasPositiveWord = markers.hasPos,
+                                HasNegativeWord = markers.hasNeg,
+                                Sentiment = lbl,
+                                Weight = 1.0f
+                            });
                         }
                     }
                 }
@@ -368,7 +429,17 @@ namespace SupportTriage
                             if (lbl != "positive" && lbl != "negative" && lbl != "neutral") continue;
                             if (string.IsNullOrEmpty(txt)) continue;
                             var pt = PreprocessText(txt);
-                            domainAll.Add(new TicketInput { Text = pt, TextLength = pt.Length, Sentiment = lbl, Weight = 1.0f });
+                            var markers = DetectWordMarkers(txt);
+                            domainAll.Add(new TicketInput
+                            {
+                                Text = pt,
+                                TextLength = pt.Length,
+                                HasPositiveWord = markers.hasPos,
+                                HasNegativeWord = markers.hasNeg,
+                                ShortPositive = (pt.Length < 30 && markers.hasPos == 1f) ? 1f : 0f,
+                                Sentiment = lbl,
+                                Weight = 1.0f
+                            });
                         }
                     }
                 }
